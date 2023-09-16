@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+
+from binascii import b2a_hex
+import contextlib
+from datetime import datetime
+import glob
+from functools import reduce
+from hashlib import sha256
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from os import environ, fork, mkdir, path, stat, urandom, waitid, CLD_EXITED, P_PID, WEXITED
+import requests
+from shutil import rmtree
+import socket
+from subprocess import PIPE, Popen, run, STDOUT
+import sys
+from threading import Thread
+from time import sleep, time
+from typing import NamedTuple
+from urllib.parse import parse_qs
+
+def eprint(*args, **kwargs):
+	print(*args, file=sys.stderr, **kwargs)
+
+def split_unescaped(s, d):
+	bs = []
+
+	for b in s.split("\\\\"):
+		a = [q.split(d) for q in b.split("\\" + d)]
+		bs.append(reduce(lambda x,y : x[:-1] + [x[-1]+d+y[0]] + y[1:], a))
+
+	return reduce(lambda x,y : x[:-1] + [x[-1]+'\\\\'+y[0]] + y[1:], bs)
+
+def parse_branch_services(services):
+	if len(services) == 0:
+		return {}
+
+	res = {}
+
+	for branch_services in split_unescaped(services, ';'):
+		ref, names = map(lambda x : x.replace('\\\\', '\\'), split_unescaped(branch_services, '='))
+		res[ref] = [name for name in split_unescaped(names, ',')]
+
+	return res
+
+global build_command
+build_command = environ['BUILD_COMMAND']
+global repo
+repo = environ['REPO']
+port = int(environ['PORT'])
+
+global services
+services = parse_branch_services(environ['SERVICES'])
+
+global allowed_refs
+allowed_refs = environ.get('ALLOWED_REFS', None)
+if allowed_refs:
+	allowed_refs = allowed_refs.split(",")
+else:
+	allowed_refs = services.keys()
+
+# TODO
+# global gitea_oath (bool)
+# https://oauth.net/code/python/
+
+global info_key
+info_key = environ.get('INFO_KEY')
+if not info_key:
+	info_key = b2a_hex(urandom(48)).decode('utf-8')
+
+global build_bearer_values
+build_bearer_values = list(filter(lambda x: len(x) > 0, environ.get('BUILD_BEARER_VALUES', '').split(' ')))
+
+def timing_equals(a, b):
+	if len(a) != len(b):
+		return False
+
+	return sha256(a.encode('utf-8')).digest() == sha256(b.encode('utf-8')).digest()
+
+def verify_info_key(from_req):
+	if not info_key:
+		return False
+
+	if not from_req:
+		return False
+
+	return timing_equals(info_key, from_req)
+
+def latest_commit_modtime(what):
+	latest = run('cd .builds/{}/ 2>/dev/null && ls -t | head -n 1'.format(what), shell=True, stdout=PIPE).stdout.decode('utf-8').strip()
+	if not latest:
+		return None, None
+
+	try:
+		d = path.join('.builds', what, latest)
+		s = stat(d)
+	except Exception as e:
+		eprint("stat '{}': {}".format(d, e))
+		return None, None
+
+	return latest, s.st_mtime
+
+def auth_header_valid(from_req):
+	if len(build_bearer_values) == 0:
+		return False
+
+	if not from_req:
+		return False
+
+	bearer_prefix = "Bearer "
+	if len(from_req) < len(bearer_prefix):
+		return False
+
+	if from_req[:len(bearer_prefix)].lower() != bearer_prefix.lower():
+		return False
+
+	req_bearer = from_req[len(bearer_prefix):]
+
+	return True in [timing_equals(build_bearer, req_bearer) for build_bearer in build_bearer_values]
+
+def split_req_path(req_path: str):
+	split = req_path.split('?')
+	return split[0][1:].split('/'), parse_qs('?'.join(split[1:]))
+
+def send_file(filename, into, offset):
+	with open(filename, "rb") as f:
+		f.seek(offset)
+		into.write(f.read())
+		return f.tell()
+
+def build_dir(what):
+	return "{}-build".format(what)
+
+def target_dir(what):
+	return what
+
+def lockfile(what):
+	return '{}.lock'.format(what)
+
+def build_dir_commit(b_dir):
+	try:
+		with open(path.join(b_dir, '.commit-hash'), 'r') as f:
+			return f.read().strip()
+	except FileNotFoundError:
+		pass
+
+	return None
+
+def select_commit(what, type, id=None):
+	deployed = None
+	try:
+		with open(path.join(target_dir(what), '.commit-hash'), 'r') as f:
+			deployed = f.read().strip()
+	except FileNotFoundError:
+		pass
+
+	if type == 'commit':
+		return id, id == deployed
+
+	if type == 'deployed':
+		return deployed, True
+
+	if type == 'last':
+		commit = build_dir_commit(build_dir(what))
+		if commit:
+			return commit, commit == deployed
+
+		return deployed, True
+
+	return None, False
+
+def read_line_vars_into_dict(lines):
+	d = {}
+
+	for l in iter(lines.splitlines()):
+		name, value = l.split('=', 1)
+		d[name] = value
+
+	return d
+
+def build_info_dir(what, commit):
+	return ".builds/{}/{}".format(what, commit)
+
+def success(bid):
+	return path.exists(path.join(bid, '.deployed-successfully'))
+
+def build_active(what, commit):
+	# atm, only one worker at a time:
+	if commit != build_dir_commit(build_dir(what)):
+		return False
+
+	cp = run(['flock', '-n', lockfile(what), 'true'])
+	if cp.returncode == 0:
+		return False
+
+	# TODO still a race. flock may fail for other reasons that being unable to obtain the lock
+	# also, it would be nice if this didn't actually acquire the lock
+
+	cp = run(['flock', '-w', '1', lockfile(what), 'true'])
+	return cp.returncode != 0
+
+def accept_any_read_auth(headers, query):
+	if verify_info_key(query.get('info_key', [''])[0]):
+		return True
+
+	cookies = SimpleCookie(headers.get('Cookie'))
+	c_info_key = cookies.get('info_key', None)
+	if c_info_key and verify_info_key(c_info_key.value):
+		return True
+
+	if auth_header_valid(headers.get('Authorization')):
+		return True
+
+	return False
+
+def format_journal_json(j):
+	# 'SYSLOG_IDENTIFIER' '__CURSOR'
+	ts, us = divmod(int(j['__REALTIME_TIMESTAMP']), 1000000)
+	ts = datetime.utcfromtimestamp(ts)
+
+	msg = j['MESSAGE']
+	#if isinstance(msg, list):
+	#	msg = bytes(msg)
+	#else:
+	if isinstance(msg, list):
+		msg = bytes(msg).decode('utf-8')
+
+	if len(msg) > 0 and msg[-1] == '\n':
+		msg = msg[:-1]
+
+	return "{}.{:06d} {}: {}\n".format(ts, us, j['_PID'], msg)
+
+def badge_info(what, commit, deployed):
+	if not commit:
+		return 'unknown', '?'
+
+	if deployed:
+		return 'success', 'done'
+
+	bid = build_info_dir(what, commit)
+	if not path.exists(bid):
+		return 'unknown', '?'
+
+	if build_active(what, commit):
+		return 'active', 'running'
+
+	if success(bid):
+		return 'success', 'done'
+	else:
+		return 'error', 'ouch'
+
+class BadgeColor(NamedTuple):
+	foreground: str
+	background: str
+
+global badge_colors
+badge_colors = {
+	'unknown': BadgeColor('#111', '#bbb'),
+	'active': BadgeColor('#002', '#88f'),
+	'error': BadgeColor('#200', '#b22'),
+	'success': BadgeColor('#020', '#2b2'),
+}
+
+def render_badge(url, border, bg, fg, text, tooltip = None):
+	tooltip_xml = '<title>{}</title>'.format(tooltip) if tooltip else ''
+	return '''<svg width="100" height="26" xmlns="http://www.w3.org/2000/svg">
+			<a href="{url}">
+				{tooltip_xml}
+				<rect x="0" y="0" width="100%" height="100%" stroke="{border}" stroke-width="3px" fill="{bg}"/>
+				<text x="50%" y="55%" dominant-baseline="middle" text-anchor="middle" style="font-size: 18" fill="{fg}">{text}</text>
+			</a>
+		</svg>'''.format(url=url, tooltip_xml=tooltip_xml, border=border, fg=fg, bg=bg, text=text)
+
+def get_service_state(name):
+	properties = ['ActiveState', 'Result', 'StateChangeTimestamp', 'SubState']
+
+	rc = run(['systemctl', 'show', '--user', '--timestamp=unix',
+		'--property=' + ','.join(properties), name], capture_output=True)
+	if rc.returncode != 0:
+		eprint("failed to fetch service data: {}".format(pc.stderr.decode('utf-8')))
+		return 'unknown', None, False
+
+	d = read_line_vars_into_dict(rc.stdout.decode('utf-8'))
+
+	notes = []
+	framed = True
+	if d['ActiveState'] == 'active': # inactive/active
+		notes.append(d['SubState'])
+		if d['SubState'] == 'running': # dead/running
+			state = 'active'
+			framed = False
+		else:
+			state = 'success'
+	else:
+		notes.append(d['Result'])
+		if d['Result'] == 'failure': # success/failure
+			state = 'error'
+		else:
+			state = 'success'
+
+	since = int(d['StateChangeTimestamp'][1:]) # remove prefix '@'
+	dur = int(time()) - since
+	notes.append('since {:02d}:{:02d}:{:02d} ago'.format(dur // 3600, (dur // 60) % 60, dur % 60))
+
+	text = "{} ({})".format(state, ', '.join(notes))
+
+	return state, text, framed
+
+class MyServer(BaseHTTPRequestHandler):
+	def start_build(self, what, dont_wait_for_worker):
+		if what not in allowed_refs:
+			self.send_error(404, "unknown ref")
+			return
+
+		b_dir = build_dir(what)
+
+		commit, previous_mtime = latest_commit_modtime(what)
+
+		env = {
+			'BUILD_DIR': b_dir,
+			'TARGET_DIR': target_dir(what),
+			'REPO': repo,
+			'BUILD_COMMAND': build_command,
+			'DBUS_SESSION_BUS_ADDRESS': environ['DBUS_SESSION_BUS_ADDRESS'],
+		}
+
+		if len(self.headers.get('Force-Retry', '')) > 0:
+			env['FORCE_RETRY'] = '1'
+
+		c_pid = fork()
+		if c_pid == 0:
+			Popen(['flock', path.abspath(lockfile(what)), '/usr/bin/sfds_worker', what], env=env)
+			sys.exit()
+
+		status = waitid(P_PID, c_pid, WEXITED)
+		if status.si_code != CLD_EXITED or status.si_status != 0:
+			self.send_error(502, "failed to start worker ({}, {})".format(status, ))
+			return
+
+		if dont_wait_for_worker:
+			self.send_response(200)
+			self.end_headers()
+
+			self.wfile.write(bytes('OK', "utf-8"))
+			return
+
+		# TODO it would be wonderfull to know whether the process is up or not
+
+		commit, mtime = latest_commit_modtime(what)
+
+		tries = 0
+		while not mtime or mtime == previous_mtime:
+			commit, mtime = latest_commit_modtime(what)
+
+			tries = tries + 1
+			if tries > 10:
+				self.send_error(502, "error waiting for a new build to start")
+				return
+
+			sleep(1)
+
+		self.send_response(200)
+		self.send_header("Info-Key", info_key)
+		self.end_headers()
+
+		self.wfile.write(bytes(commit, "utf-8"))
+
+	def do_POST(self):
+		req_path, query = split_req_path(self.path)
+
+		if not auth_header_valid(self.headers.get('Authorization')):
+			self.send_error(401, "no auth")
+			return
+
+		if req_path == ['build', 'start_gitea']:
+			body = json.loads(self.rfile.read())
+
+			ref = body['ref']
+			if not ref.startswith('refs/heads/'):
+				self.send_error(400, "invalid ref")
+				return
+
+			# gitea doesn't care
+			dont_wait_for_worker = True
+			# TODO refs can contain slashes
+			self.start_build(ref.split('/')[-1], dont_wait_for_worker)
+		elif req_path[:2] == ['build', 'start']:
+			dont_wait_for_worker = len(query.get('dont_wait_for_worker', [''])[0]) > 0
+			self.start_build('/'.join(req_path[2:]), dont_wait_for_worker)
+		else:
+			self.send_error(404, "not found")
+
+	def do_GET(self):
+		rem_path, query = split_req_path(self.path)
+		what = rem_path[0]
+		rem_path = rem_path[1:]
+
+		if what == 'favicon.ico':
+			self.send_response(404)
+			self.end_headers()
+			return
+
+		if not accept_any_read_auth(self.headers, query):
+			self.send_error(401, "no auth")
+			return
+
+		if what == "raw_service_log_data":
+			ref, service_name = rem_path[:2]
+
+			if ref not in services.keys():
+				self.send_error(404, "can't find ref")
+				return
+
+			if service_name not in services[ref]:
+				self.send_error(404, "can't find service")
+				return
+
+			pc = Popen(['journalctl', '-fq', '-o', 'json',
+				'--user-unit', service_name], bufsize=0, stdout=PIPE, stderr=STDOUT)
+
+			self.send_response(200)
+			self.end_headers()
+
+			# for line in pc.stdout:
+			#for line in iter(pc.stdout.readline, b''):
+			while True:
+				line = pc.stdout.readline()
+				buf = format_journal_json(json.loads(line))
+				self.wfile.write(bytes(buf, "utf-8"))
+
+			pc.wait()
+
+			if pc.returncode != 0:
+				self.send_error(502, "failed to fetch log: {}".format(pc.stderr.decode('utf-8')))
+				return
+		elif what == "service_log_data":
+			ref, service_name = rem_path[:2]
+
+			if ref not in services.keys():
+				self.send_error(404, "can't find ref")
+				return
+
+			if service_name not in services[ref]:
+				self.send_error(404, "can't find service")
+				return
+
+			cursor = self.headers.get('cursor', None)
+
+			# '-U', '2 seconds ago',
+			# TODO
+			# '--show-cursor' -> last line: '-- cursor: $cursor'
+			pc = run(['journalctl', '-q', '-o', 'json',
+				*(['--after-cursor', cursor] if cursor else []),
+				'--user-unit', service_name], capture_output=True)
+			if pc.returncode != 0:
+				self.send_error(502, "failed to fetch log: {}".format(pc.stderr.decode('utf-8')))
+				return
+
+			lines = []
+
+			for line in iter(pc.stdout.decode('utf-8').splitlines()):
+				j = json.loads(line)
+				cursor = j['__CURSOR']
+				lines.append(bytes(format_journal_json(j), 'utf-8'))
+
+			_, state_text, _ = get_service_state(service_name)
+
+			self.send_response(200)
+			self.send_header("Content-Type", 'text/plain')
+			self.send_header("Cursor", cursor)
+			self.end_headers()
+
+			self.wfile.write(bytes('{}\n'.format(cursor), "utf-8"))
+			self.wfile.write(bytes('{}\n'.format(state_text), "utf-8"))
+			for line in lines:
+				self.wfile.write(line)
+		elif what == "service_log_view":
+			ref, service_name = rem_path[:2]
+
+			if ref not in services.keys():
+				self.send_error(404, "can't find ref")
+				return
+
+			if service_name not in services[ref]:
+				self.send_error(404, "can't find service")
+				return
+
+			self.send_response(200)
+			self.send_header("Content-Type", 'text/html')
+			self.end_headers()
+
+			buf = '''<!DOCTYPE html>
+			<html><script>
+			var active = false;
+			var cursor = null;
+
+			function update(data) {{
+				var index = data.indexOf("\\n");
+				if (index == -1) {{
+					updateState('invalid response');
+					return;
+				}}
+
+				cursor = data.substring(0, index);
+				data = data.substring(index + 1);
+
+				index = data.indexOf("\\n");
+				if (index == -1) {{
+					updateState('invalid response');
+					return;
+				}}
+
+				var state = data.substring(0, index);
+				data = data.substring(index + 1);
+
+				var log = document.getElementById("log");
+				log.textContent += data;
+				while (log.textContent.length > 100000) {{
+					index = data.indexOf("\\n");
+					log.textContent = log.textContent.slice(index + 1);
+				}}
+				updateState(state);
+				updateLogState('up');
+				// TODO add button to pause/resume, pause after long period of inactivity
+				schedule(data.length > 0 ? 5 : 15);
+			}}
+
+			function updateState(text) {{
+				let state = document.getElementById("state");
+				state.textContent = text;
+			}}
+
+			function updateLogState(text) {{
+				let state = document.getElementById("log_state");
+				state.textContent = text;
+			}}
+
+			function handleResponse(response) {{
+				if (response.ok) {{
+					response.text()
+						.then((text) => update(text))
+						.catch((error) => updateLogState('error handling response: ' + error));
+				}} else {{
+					response.text()
+						.then((text) => updateLogState('error ' + response.status + ': '+ text))
+						.catch((error) => updateLogState('error handling response ' + response.status + ': ' + error));
+				}}
+			}}
+
+			function schedule(seconds) {{
+				if (!active) {{
+
+				}}
+
+				active = true;
+
+				setTimeout(function() {{
+					let options = {{}};
+					if (cursor)
+						options.headers = {{
+							'Cursor': cursor,
+						}};
+
+					fetch("/{what}/{ref}/{name}?info_key={info_key}", options)
+						.then((response) => handleResponse(response))
+						.catch((error) => updateLogState('failed to fetch: ' + error));
+				}}, 1000 * seconds);
+			}}
+
+			window.addEventListener('load', function() {{
+				schedule(1);
+
+				var console = document.getElementById("console");
+				console.textContent = "curl '" + location.protocol + '//' + location.hostname + (location.port ? ':' + location.port : '') + "/raw_{what}/{ref}/{name}?info_key={info_key}'";
+				console.onclick = function() {{
+					navigator.clipboard.writeText(console.textContent)
+				}};
+			}})
+
+			</script>
+
+			<body style="height: 100vh;">
+			<div>Service state: <div id="state" style="display: inline;">unknown</div></div>
+			View in console: <code id="console" style="cursor: pointer;"></code> (click to copy).
+			<div>Log state: <div id="log_state" style="display: inline;">unknown</div></div>
+			<pre id="log" style="overflow: scroll;"></pre>
+			</body></html>'''.format(what='service_log_data', ref=ref, name=service_name, info_key=info_key)
+
+			self.wfile.write(bytes(buf, 'utf-8'))
+		elif what == "service_badge":
+			ref, name = rem_path[:2]
+
+			if ref not in services.keys():
+				self.send_error(404, "can't find ref")
+				return
+
+			if name not in services[ref]:
+				self.send_error(404, "can't find service")
+				return
+
+			state, text, framed = get_service_state(name)
+
+			buf = render_badge(
+				'/service_log_view/{}/{}?info_key={}'.format(ref, name, info_key),
+				badge_colors[state].foreground if framed else badge_colors[state].background,
+				badge_colors[state].background,
+				badge_colors[state].foreground,
+				state, text)
+
+			self.send_response(200)
+			self.send_header("Content-Type", 'image/svg+xml')
+			self.end_headers()
+
+			self.wfile.write(bytes(buf, 'utf-8'))
+		elif what == "build_badge":
+			ref = rem_path[0]
+			commit, deployed = select_commit(ref, *rem_path[1:])
+			state, text = badge_info(ref, commit, deployed)
+
+			buf = render_badge(
+				'/build_log_view/{}/commit/{}?info_key={}'.format(ref, commit, info_key),
+				badge_colors[state].foreground if deployed else badge_colors[state].background,
+				badge_colors[state].background,
+				badge_colors[state].foreground,
+				text)
+
+			self.send_response(200)
+			self.send_header("Content-Type", 'image/svg+xml')
+			self.end_headers()
+
+			self.wfile.write(bytes(buf, 'utf-8'))
+		elif what == "raw_build_log_data":
+			ref = rem_path[0]
+			commit, _ = select_commit(ref, *rem_path[1:])
+			if not commit:
+				self.send_error(400, "can't identify commit")
+				return
+
+			bid = build_info_dir(ref, commit)
+			offset = 0
+
+			self.send_response(200)
+			self.send_header("Content-Type", 'text/plain')
+			self.end_headers()
+
+			while build_active(ref, commit):
+				offset = send_file(path.join(bid, 'build.log'), self.wfile, offset)
+
+			send_file(path.join(bid, 'build.log'), self.wfile, offset)
+		elif what == "build_log_data":
+			ref = rem_path[0]
+			commit, _ = select_commit(ref, *rem_path[1:])
+			if not commit:
+				self.send_error(400, "can't identify commit")
+				return
+
+			offset = int(query.get('offset', ['0'])[0])
+
+			active = build_active(ref, commit)
+
+			bid = build_info_dir(ref, commit)
+			try:
+				with open(path.join(bid, 'build.log'), "rb") as f:
+					f.seek(offset)
+					buf = f.read()
+					new_offset = f.tell()
+			except FileNotFoundError:
+				new_offset = 0
+				if active:
+					# assume that it will get there sometime soon
+					buf = b''
+				else:
+					buf = b'[no logfile exists]'
+
+			# log exists, service was active
+			if active:
+				state = 0
+			else:
+				state = 1 if success(bid) else 2
+
+			self.send_response(200)
+			self.send_header("Content-Type", 'text/plain')
+			self.end_headers()
+
+			self.wfile.write(bytes('{}\n'.format(new_offset), "utf-8"))
+			self.wfile.write(bytes('{}\n'.format(state), "utf-8"))
+			self.wfile.write(buf)
+		elif what == "build_log_view":
+			self.send_response(200)
+			self.send_header("Content-Type", 'text/html')
+			self.end_headers()
+
+			buf = '''<!DOCTYPE html>
+			<html><script>
+			var offset = 0;
+
+			function update(data) {{
+				var index = data.indexOf("\\n");
+				if (index == -1) {{
+					updateState('invalid response');
+					return;
+				}}
+
+				offset = parseInt(data.substring(0, index), 10);
+				data = data.substring(index + 1);
+
+				index = data.indexOf("\\n");
+				if (index == -1) {{
+					updateState('invalid response');
+					return;
+				}}
+
+				var finished = parseInt(data.substring(0, index), 10);
+				data = data.substring(index + 1);
+
+				var log = document.getElementById("log");
+				log.textContent += data;
+				//log.textContent += data.replace(/(?:\\r\\n|\\r|\\n)/g, '<br>');
+				while (log.textContent.length > 100000) {{
+					index = data.indexOf("\\n");
+					log.textContent = log.textContent.slice(index + 1);
+				}}
+				if (finished == 0) {{
+					updateState('running');
+					schedule(5);
+				}}
+				else if (finished == 1) {{
+					updateState('success');
+				}}
+				else if (finished == 2) {{
+					updateState('failure');
+				}}
+			}}
+
+			function updateState(text) {{
+				var state = document.getElementById("state");
+				state.textContent = text;
+			}}
+
+			function handleResponse(response) {{
+				if (response.ok) {{
+					response.text()
+						.then((text) => update(text))
+						.catch((error) => updateState('error handling response: ' + error));
+				}} else {{
+					response.text()
+						.then((text) => updateState('error ' + response.status + ': '+ text))
+						.catch((error) => updateState('error handling response ' + response.status + ': ' + error));
+				}}
+			}}
+
+			function schedule(seconds) {{
+				setTimeout(function() {{
+					fetch("/{0}/{1}?info_key={2}&offset=" + offset)
+						.then((response) => handleResponse(response))
+						.catch((error) => updateState('failed to fetch: ' + error));
+				}}, 1000 * seconds);
+			}}
+
+			window.addEventListener('load', function() {{
+				schedule(1);
+
+				var console = document.getElementById("console");
+				console.textContent = "curl '" + location.protocol + '//' + location.hostname + (location.port ? ':' + location.port : '') + "/raw_{0}/{1}?info_key={2}'";
+				console.onclick = function() {{
+					navigator.clipboard.writeText(console.textContent)
+				}};
+			}})
+
+			</script>
+
+			<body>
+			<div>Build state: <div id="state" style="display: inline;">unknown</div></div>
+			View in console: <code id="console" style="cursor: pointer;"></code> (click to copy).
+			<pre id="log"></pre>
+			</body></html>'''.format('build_log_data', '/'.join(rem_path), info_key)
+
+			self.wfile.write(bytes(buf, 'utf-8'))
+
+		elif what == "overview":
+			self.send_response(200)
+			self.send_header("Content-Type", 'text/html')
+			self.send_header("Set-Cookie", 'info_key="{}"; Max-Age: 86400; Secure; HttpOnly'.format(info_key))
+			self.end_headers()
+
+			# alternative on <a>: style="vertical-align: middle"
+			self.wfile.write(bytes('''<!DOCTYPE html>
+			<html>
+			<head>
+			<style>
+			div {
+				display: flex;
+				align-items:center;
+			}
+			</style>
+			</head>
+
+			<body>\n''', 'utf-8'))
+
+			for ref_idx, ref in enumerate(allowed_refs):
+				if ref_idx != 0:
+					self.wfile.write(bytes('<hr>\n', 'utf-8'))
+
+				self.wfile.write(bytes('''<h1>{}</h1>
+				  <table>
+				    <tr><td><b>Builds</b></td></tr>'''.format(ref), 'utf-8'))
+
+				deployed, _ = select_commit(ref, 'deployed', id=None)
+
+				# newest first
+				commits = run('cd .builds/{}/ 2>/dev/null && ls -t'.format(ref), shell=True, stdout=PIPE).stdout.decode('utf-8').splitlines()
+				for commit in commits:
+					commit = commit.strip()
+
+					self.wfile.write(bytes('''  <tr>
+					    <td><{2}>{1}</{2}></td>
+					    <td>
+					      <a href=/build_log_view/{0}/commit/{1}>
+					      <img src="/build_badge/{0}/commit/{1}" alt="build status {1}">
+					      </a>
+					    </td>
+					  </tr>
+					'''.format(ref, commit, 'i' if commit == deployed else 'span'), 'utf-8'))
+
+				ns = services.get(ref, [])
+
+				if len(ns) > 0:
+					self.wfile.write(bytes('  <tr><td><b>Services</b></td></tr>', 'utf-8'))
+
+				for name in ns:
+					self.wfile.write(bytes('''  <tr>
+						    <td>{name}</td>
+						    <td>
+					        <a href=/service_log_view/{ref}/{name}>
+					        <img src="/service_badge/{ref}/{name}" alt="service status {name}">
+					        </a>
+						    </td>
+						  </tr>
+						'''.format(ref=ref, name=name), 'utf-8'))
+
+				self.wfile.write(bytes('</table>\n', 'utf-8'))
+
+			self.wfile.write(bytes('</body></html>', 'utf-8'))
+		else:
+			self.send_error(404, "not found")
+
+
+class Ipv6Server(ThreadingHTTPServer):
+	address_family = socket.AF_INET6
+
+	def server_bind(self):
+		# suppress exception when protocol is IPv4
+		self.socket.setsockopt(
+			socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+		return super().server_bind()
+
+def create(server_address, handler):
+	eprint("listening on http://{}:{}".format(server_address[0], server_address[1]))
+	if ':' in server_address[0]:
+		return Ipv6Server(server_address, handler)
+	else:
+		return ThreadingHTTPServer(server_address, handler)
+
+if __name__ == "__main__":
+	Thread(target=lambda : create(('127.0.0.1', port), MyServer).serve_forever).start()
+	webServer = create(('::1', port), MyServer)
+
+	try:
+		webServer.serve_forever()
+	except KeyboardInterrupt:
+		pass
+
+	webServer.server_close()

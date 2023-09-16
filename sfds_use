@@ -1,0 +1,53 @@
+#!/bin/bash -e
+
+url="$1"
+what="$2"
+
+ecurl() {
+	curl \
+		-sS --fail \
+		-H "Authorization: Bearer $AUTH_BEARER" \
+		"$@"
+}
+
+start_args=()
+if [ -n "$FORCE_RETRY" ]; then
+	start_args+=(-H "Force-Retry: yes")
+fi
+
+if commit="$(ecurl -X POST "${start_args[@]}" "$url/build/start/$what")"; then
+	build_spec="/commit/$commit"
+else
+	build_spec="/commit/$CI_COMMIT_SHA"
+fi
+
+fail_count=0
+
+finished=0
+pos=0
+
+while [ "$finished" = 0 ] && sleep 10; do
+	{
+		read new_pos
+		read new_finished
+		cat
+	} < <(
+		ecurl -s -X GET \
+			"$url/build_log_data/$what$build_spec?offset=$pos"
+	)
+
+	if [ -z "$new_pos" ] || [ "$new_pos" -lt "$pos" ]; then
+		let fail_count++
+		if [ "$fail_count" -gt 5 ]; then
+			echo "failed to get build log chunk" >&2
+			exit 1
+		fi
+
+		continue
+	fi
+
+	finished="$new_finished"
+	pos="$new_pos"
+done
+
+[ "$finished" = 1 ]

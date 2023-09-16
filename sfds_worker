@@ -1,0 +1,74 @@
+#!/bin/sh -e
+
+branch="$1"
+shift
+
+latest_commit_hash() {
+	if [ -z "$NO_UPDATE" ]; then
+		git -C "$REPO" fetch origin "$branch" >/dev/null
+	fi
+
+	# $branch shows another commit as well: refs/heads/$branch
+	local ref="refs/remotes/origin/heads/$branch"
+	git -C "$REPO" show-ref -s "$ref"
+}
+
+delete_old_builds() {
+	local keep=5
+
+	ls -t .builds/ | tail -n "+$keep" | xargs rm -rf
+}
+
+old_commit_hash=""
+
+while { commit_hash="$(latest_commit_hash)" ; [ "$commit_hash" != "$old_commit_hash" ] ; }; do
+	old_commit_hash="$commit_hash"
+
+	build_info_dir=".builds/$branch/$commit_hash"
+	if [ -e "$build_info_dir" ]; then
+		touch "$build_info_dir"
+	fi
+
+	if [ -n "$FORCE_RETRY" ]; then
+		FORCE_RETRY=""
+	else
+		# don't rebuild the same thing
+		[ "$(cat "$TARGET_DIR/.commit-hash" 2>/dev/null)" != "$commit_hash" ] || continue
+		[ "$(cat "$BUILD_DIR/.commit-hash" 2>/dev/null)" != "$commit_hash" ] || continue
+	fi
+
+	rm -rf "$build_info_dir"
+	mkdir -p "$build_info_dir"
+
+	rm -rf "$BUILD_DIR"
+	mkdir -p "$BUILD_DIR"
+	echo "$commit_hash" > "$BUILD_DIR/.commit-hash"
+
+	(
+		set -e
+
+		git -C "$REPO" archive "$commit_hash" | (
+			echo "$(date) - starting build for $commit_hash (from $branch)"
+
+			env -C "$BUILD_DIR" -i - \
+				TARGET_DIR="$TARGET_DIR" BRANCH="$branch" \
+				PATH="$PATH" DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+				sh -c "$BUILD_COMMAND"
+		)
+
+		[ ! -e "$TARGET_DIR" ] || mv "$TARGET_DIR" "$TARGET_DIR-old"
+		mv "$BUILD_DIR" "$TARGET_DIR"
+
+		rm -rf "$TARGET_DIR-old"
+
+		touch "$build_info_dir/.deployed-successfully"
+		echo "build successful"
+	) >"$build_info_dir/build.log" 2>&1
+
+	delete_old_builds
+done
+
+if [ -z "$commit_hash" ]; then
+	echo "failed to fetch ref" >&2
+	exit 1
+fi
