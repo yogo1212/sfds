@@ -1,0 +1,62 @@
+#!/bin/bash -e
+
+# just an example
+
+checksum() {
+	echo "calculating checksum of repo archive:"
+	sha256sum
+}
+
+go() {
+	local app_name="$1"
+	local service="$app_name-$BRANCH"
+
+	mkdir src
+	cd src
+	tar -xf -
+
+	go build -o "../$app_name"
+	cd ..
+	rm -rf src
+
+	systemctl --user enable "$service"
+	systemctl --user restart "$service"
+}
+
+nodesjs() {
+	local app_name="$1"
+	shift
+
+	tar -xf -
+
+	podman_args=( "$@" )
+	# or add any other:
+	# podman_args+=
+
+	if [ -d "$TARGET_DIR" ]; then
+		cp -r "$TARGET_DIR"/{node_modules,.yarn-cache} .
+	fi
+
+	mkdir -p .yarn-cache
+
+	podman_run() {
+		podman run --rm \
+			"${podman_args[@]}" \
+			-v "$PWD/.yarn-cache:/home/node/.cache/yarn" \
+			-v "$PWD":/app \
+			docker.io/library/node:18-alpine \
+			"$@"
+	}
+
+	# make sure to install dev dependencies for typescript validation
+	podman_run yarn install --frozen-lockfile --production=false
+	podman_run yarn build
+
+	local service="$app_name-$BRANCH"
+	systemctl --user stop "$service" || true
+
+	echo "restarting $service"
+	systemctl --user enable --now "$service"
+}
+
+"$@"
