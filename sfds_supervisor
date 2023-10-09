@@ -53,6 +53,9 @@ port = int(environ['PORT'])
 global services
 services = parse_branch_services(environ['SERVICES'])
 
+global worker_bin
+worker_bin = environ.get('WORKER_BIN', path.join(path.dirname(path.realpath(__file__)), 'sfds_worker'))
+
 global allowed_refs
 allowed_refs = environ.get('ALLOWED_REFS', None)
 if allowed_refs:
@@ -333,7 +336,7 @@ class MyServer(BaseHTTPRequestHandler):
 		#	'flock', path.abspath(lockfile(what)), 'sfds_worker', what])
 		c_pid = fork()
 		if c_pid == 0:
-			Popen(['flock', path.abspath(lockfile(what)), '/usr/bin/sfds_worker', what], env=env)
+			Popen(['flock', path.abspath(lockfile(what)), worker_bin, what], env=env)
 			_exit(0)
 
 		status = waitid(P_PID, c_pid, WEXITED)
