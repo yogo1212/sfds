@@ -9,7 +9,7 @@ from hashlib import sha256
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from os import environ, fork, mkdir, path, stat, urandom, waitid, CLD_EXITED, P_PID, WEXITED
+from os import environ, _exit, fork, mkdir, path, stat, urandom, waitid, CLD_EXITED, P_PID, WEXITED
 import requests
 from shutil import rmtree
 import socket
@@ -328,14 +328,17 @@ class MyServer(BaseHTTPRequestHandler):
 		if len(self.headers.get('Force-Retry', '')) > 0:
 			env['FORCE_RETRY'] = '1'
 
+		#pc = run(['systemd-run', '--user',
+		#	*sum([['-E', '{}={}'.format(name, value)] for name, value in env.items()], []),
+		#	'flock', path.abspath(lockfile(what)), 'sfds_worker', what])
 		c_pid = fork()
 		if c_pid == 0:
 			Popen(['flock', path.abspath(lockfile(what)), '/usr/bin/sfds_worker', what], env=env)
-			sys.exit()
+			_exit(0)
 
 		status = waitid(P_PID, c_pid, WEXITED)
 		if status.si_code != CLD_EXITED or status.si_status != 0:
-			self.send_error(502, "failed to start worker ({}, {})".format(status, ))
+			self.send_error(502, "failed to start worker ({}, {})".format(status.si_code, status.si_status))
 			return
 
 		if dont_wait_for_worker:
