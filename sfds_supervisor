@@ -498,6 +498,8 @@ class MyServer(BaseHTTPRequestHandler):
 
 			buf = '''<!DOCTYPE html>
 			<html><script>
+			const max_buffer_size = 1000000;
+
 			var active = false;
 			var cursor = null;
 
@@ -520,9 +522,11 @@ class MyServer(BaseHTTPRequestHandler):
 				var state = data.substring(0, index);
 				data = data.substring(index + 1);
 
+				data = data.substring(data.length - max_buffer_size);
+
 				var log = document.getElementById("log");
 				log.textContent += data;
-				while (log.textContent.length > 100000) {{
+				while (log.textContent.length > max_buffer_size) {{
 					index = data.indexOf("\\n");
 					log.textContent = log.textContent.slice(index + 1);
 				}}
